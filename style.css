@@ -1,0 +1,23 @@
+#hc-panel {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 100000;
+  display: none;
+}
+#hc-fab {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  background: #cba6f7;
+  color: #1e1e2e;
+  border: none;
+  font-size: 24px;
+  cursor: pointer;
+  z-index: 99999;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+}
