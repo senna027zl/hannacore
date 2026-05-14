@@ -1,0 +1,13 @@
+{
+    "display_name": "Hannacore",
+    "description": "Skills + Memoria Local + Mnemosyne Semantica para personagens",
+    "loading_order": 10,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Senna",
+    "version": "2.0.0",
+    "license": "AGPL-3.0",
+    "auto_update": false
+}
