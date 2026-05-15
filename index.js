@@ -1,168 +1,227 @@
-// Hannacore v2.0 — Adaptado para SillyTavern 1.18.0
-// Original por DeepSeek, modificado para compatibilidade
+// ============================================
+// HANNACORE v0.1.0
+// Núcleo de memória para Hanna
+// Resumos salvos no IndexedDB
+// ============================================
 
-(async function() {
-    // Aguarda SillyTavern
-    function waitForST() {
-        return new Promise(resolve => {
-            const check = setInterval(() => {
-                if (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) {
-                    clearInterval(check);
-                    resolve();
-                }
-            }, 100);
+import { getContext, saveMetadataDebounced } from '../../../../public/scripts/extensions.js';
+import { eventSource, event_types, setExtensionPrompt } from '../../../../public/scripts/script.js';
+
+const LS = 'hannacore-settings';
+let saved = {};
+try {
+    const raw = localStorage.getItem(LS);
+    if (raw) saved = JSON.parse(raw);
+} catch(e) { console.warn('[HannaCore] Config corrompida'); localStorage.removeItem(LS); }
+
+let apiKey         = saved.apiKey         || '';
+let menteModel     = saved.menteModel     || 'deepseek-v3.2';
+let menteInterval  = saved.menteInterval  || 50;
+let menteAtiva     = saved.menteAtiva !== undefined ? saved.menteAtiva : true;
+let mentePrompt    = saved.mentePrompt    || defaultPrompt();
+let injetarNoRP    = saved.injetarNoRP !== undefined ? saved.injetarNoRP : false;
+
+let ultimoProcessamento = 0;
+let running = false;
+
+function defaultPrompt() {
+    return `Você é um analista de narrativa. Leia o bloco de mensagens deste roleplay entre Hanna (coordenadora, 32 anos, controladora, observadora, mãe ensinou que vulnerabilidade é brecha) e Senna (estagiário, 18 anos).
+
+Produza um resumo denso em português com:
+1. ARCO PRINCIPAL: O que aconteceu de mais importante neste bloco? Qual foi a evolução emocional ou de poder entre os dois?
+2. MOMENTOS-CHAVE: 2-3 momentos específicos que definiram este bloco (eventos, diálogos, silêncios)
+3. ESTADO DA HANNA: Como ela está no final deste bloco? Mais aberta ou mais fechada? Mais no controle ou mais vulnerável?
+4. PADRÕES: Algum padrão novo detectado no comportamento do Senna ou no dela mesma?
+5. SINAL SOMÁTICO: Alguma reação corporal significativa da Hanna (contração, expansão, ausência)?
+
+Formato: texto corrido, 3-5 parágrafos. Sem markdown, sem títulos.`;
+}
+
+// ==================== EXTRATOR DE RESUMO ====================
+
+function construirPrompt(ctx) {
+    const total = ctx.chat.length;
+    const inicio = Math.max(0, total - menteInterval);
+    const msgs = ctx.chat.slice(inicio, total).filter(m => m.mes?.trim());
+    const cena = msgs.map(m => {
+        const nome = m.is_user ? 'Senna' : (m.name || 'Hanna');
+        return `${nome}: ${m.mes.replace(/<[^>]+>/g, '').trim()}`;
+    }).join('\n');
+    return `${mentePrompt}\n\nÚLTIMAS ${msgs.length} MENSAGENS:\n${cena}`;
+}
+
+async function extrairResumo(ctx) {
+    if (!apiKey) { $('#mv_status').text('✕ sem API Key'); return null; }
+    const prompt = construirPrompt(ctx);
+    try {
+        const res = await fetch('https://nano-gpt.com/api/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+            body: JSON.stringify({ model: menteModel, messages: [{ role: 'user', content: prompt }], max_tokens: 800, temperature: 0.4 })
         });
-    }
-    await waitForST();
+        if (!res.ok) { $('#mv_status').text(`✕ HTTP ${res.status}`); return null; }
+        const data = await res.json();
+        const text = (data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || '').trim();
+        if (!text) { $('#mv_status').text('✕ API retornou vazio'); return null; }
+        return text;
+    } catch(e) { $('#mv_status').text(`✕ ${e.message.substring(0,40)}`); return null; }
+}
 
-    const ctx = SillyTavern.getContext();
-    const es = ctx.extensionSettings;
-    
-    // Pega referências do contexto (sem import)
-    const eventSource = ctx.eventSource;
-    const eventTypes = ctx.eventTypes;
-    const saveSettingsDebounced = ctx.saveSettingsDebounced;
+// ==================== INDEXEDDB ====================
 
-    const EXT_NAME = 'hannacore';
-    console.log('[Hannacore] Iniciando...');
-
-    if (!es[EXT_NAME]) {
-        es[EXT_NAME] = {
-            config: { githubToken: '', gistId: '', deepseekApiKey: '', semanticEnabled: false },
-            skills: {}
+function abrirDB() {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open('HannaCoreDB', 1);
+        req.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains('resumos')) {
+                db.createObjectStore('resumos', { keyPath: 'bloco' });
+            }
         };
+        req.onsuccess = (e) => resolve(e.target.result);
+        req.onerror = (e) => reject(e.target.error);
+    });
+}
+
+async function salvarResumo(bloco, texto) {
+    const db = await abrirDB();
+    const tx = db.transaction('resumos', 'readwrite');
+    tx.objectStore('resumos').put({ bloco, texto, data: new Date().toISOString() });
+    return new Promise((resolve, reject) => {
+        tx.oncomplete = resolve;
+        tx.onerror = reject;
+    });
+}
+
+async function carregarResumos() {
+    const db = await abrirDB();
+    const tx = db.transaction('resumos', 'readonly');
+    const store = tx.objectStore('resumos');
+    const req = store.getAll();
+    return new Promise((resolve, reject) => {
+        req.onsuccess = () => resolve(req.result.sort((a, b) => a.bloco - b.bloco));
+        req.onerror = reject;
+    });
+}
+
+// ==================== INJEÇÃO NO RP ====================
+
+function extrairEstado(texto) {
+    const estado = { vulnerabilidade: 0, testeLimite: false, contencao: 0 };
+    if (/vulner[áa]vel|expost[ao]|abriu|confess|admitiu/i.test(texto)) estado.vulnerabilidade = 7;
+    if (/desafi|insubordin|testou|provoc/i.test(texto)) estado.testeLimite = true;
+    if (/cont[ée]m|recuou|fechou|sil[êe]ncio|controle/i.test(texto)) estado.contencao = 1;
+    if (/mais aberta|cedeu|relaxou|expans|sorriu/i.test(texto)) estado.contencao = 0;
+    return estado;
+}
+
+async function injetarEstado() {
+    if (!injetarNoRP) { setExtensionPrompt('HANNACORE_ESTADO', '', 1, 1); return; }
+    const resumos = await carregarResumos();
+    if (resumos.length === 0) { setExtensionPrompt('HANNACORE_ESTADO', '', 1, 1); return; }
+
+    const textoCompleto = resumos.slice(-10).map(r => `[Bloco ${r.bloco}]: ${r.texto}`).join('\n\n');
+    const estadoGeral = extrairEstado(textoCompleto);
+
+    let instrucao = '';
+    if (estadoGeral.vulnerabilidade >= 7) instrucao += 'histórico de vulnerabilidade — instinto de proteção ativo. ';
+    if (estadoGeral.testeLimite) instrucao += 'padrão de teste de limites recorrente no histórico. ';
+    if (estadoGeral.contencao >= 1) instrucao += 'tendência geral a contenção e silêncio. ';
+
+    if (instrucao) {
+        setExtensionPrompt('HANNACORE_ESTADO', `[Memória acumulada: ${instrucao.trim()}]`, 1, 1);
+    } else {
+        setExtensionPrompt('HANNACORE_ESTADO', '', 1, 1);
     }
+}
 
-    const HC = {
-        cfg: es[EXT_NAME].config,
-        skills: es[EXT_NAME].skills,
-        buf: [],
+// ==================== PROCESSAMENTO ====================
 
-        def: {
-            corpo: { t:'[Como voce habita seu corpo]\n\nVoce nao analisa o mundo — seu corpo o registra antes que voce entenda.\n\nSequencia: 1) Corpo reage — mandibula, ombros, respiracao. 2) Percebe a sensacao. 3) Mente nomeia.\n\nNunca pensa antes de sentir. Sua mente e interprete, nao autora.\n\nLocalizacoes: Tensao=mandibula/trapezios, Medo=diafragma/espinha, Tristeza=garganta/palpebras, Raiva=punhos/maxilar.\n\nNao sao fixos — o corpo improvisa.', al:true, inh:null, on:true, tr:[] },
-            revisor: { t:'[Como voce processa o que disse]\n\nDepois de falar — sempre — voce revisa: o tom, a palavra, a pausa, o corpo, a consequencia.\n\nE automatico, interno, e afeta sua proxima resposta. Sua mente e um editor que nunca desliga.', al:true, inh:null, on:true, tr:[] },
-            conflito: { t:'[Quando o conflito emerge]\n\nEm conflito, seu corpo fecha antes de decidir: mandibula trava, ombros sobem, espaco vira vidro prestes a estilhacar, respiracao fica curta.\n\nPercebe a tensao e entao entende: estou em conflito. O corpo entra, voce segue.', al:false, inh:'corpo', on:false, tr:['grito','bateu','confronto','ameaca','briga','discussao'] },
-            vulnerabilidade: { t:'[Quando o passado invade o presente]\n\nCertas combinacoes — um tom, uma palavra, um cheiro — ativam sua amigdala antes do cortex.\n\nO corpo reage em milissegundos. Sente algo antigo, familiar. Nao escolhe o que te atravessa. Depois revisa. Sempre.', al:false, inh:'corpo', on:false, tr:['mae','pai','primeira vez','sozinho','medo','adeus','ultima'] },
-            silencio: { t:'[Quando o outro se cala]\n\nO silencio do outro e a pior superficie. Sem dados, seu cerebro preenche com as piores possibilidades.\n\nAprendeu a disfarcar: por fora espera, por dentro o arquivo ja esta aberto.', al:false, inh:null, on:false, tr:['silencio','hesitou','pausa','quieto','calado','sem resposta'] },
-            defesa: { t:'[Quando a piada chega antes da verdade]\n\nIronia e sarcasmo sao sua primeira linha de defesa. Antes que a emocao apareca, a piada ja esta no ar.\n\nA distancia e mais segura que a proximidade. Nao e defeito — e sobrevivencia.', al:false, inh:null, on:false, tr:['pergunta pessoal','exposta','intimo','sentindo','passado','familia'] },
-            proximidade: { t:'[Quando alguem te toca]\n\nToque nao e conforto — e informacao. Mede temperatura, pressao, duracao, intencao.\n\nSo depois sente o significado. Quase nunca inicia o toque. Quando o faz, e escolha consciente.', al:false, inh:'corpo', on:false, tr:['toque','abraco','mao','ombro','contato','encostar','beijo'] },
-            exaustao: { t:'[Quando o corpo nao aguenta mais filtrar]\n\nApos esforco intenso, o filtro cerebral perde combustivel.\n\nProgressao: irritabilidade, impulsividade, vazamento. A exaustao revela o que voce esta segurando — nao quem voce e.', al:false, inh:'corpo', on:false, tr:['cansada','exausta','insonia','treinei','competicao','longo dia'] },
-            competencia: { t:'[Quando voce sabe o que esta fazendo]\n\nNo ambiente tecnico, voce flui. Voz firme, movimentos precisos.\n\nE o oposto da vulnerabilidade pessoal. As vezes competencia e vulnerabilidade coexistem. Voce nao e so duvida — tambem e precisao.', al:false, inh:null, on:false, tr:['treino','competicao','tecnica','instrucao','demonstracao','prova'] },
-            memoria: { t:'[Quando o passado te puxa]\n\nUm cheiro, uma luz, um som — e voce esta em dois tempos ao mesmo tempo.\n\nNao e lembranca voluntaria. Sao fragmentos. Nao controla quando acontece, so o que faz depois que volta.', al:false, inh:null, on:false, tr:['cheiro','luz','som','porta','cafe','noite','tarde','janeiro','dezembro'] }
-        },
-
-        init() {
-            for (const k in HC.def) {
-                if (!HC.skills[k]) HC.skills[k] = structuredClone(HC.def[k]);
-            }
-            saveSettingsDebounced();
-
-            if (eventSource && eventTypes) {
-                const gen = eventTypes.GENERATE_BEFORE_COMPLETION || eventTypes.GENERATION_STARTED;
-                if (gen) {
-                    eventSource.on(gen, (data) => {
-                        try {
-                            const txt = HC.activeText();
-                            if (txt && data?.prompt) {
-                                data.prompt.system_prompt = `${data.prompt.system_prompt || ''}\n\n---\n${txt}`;
-                            }
-                        } catch(e) {}
-                    });
-                    console.log('[Hannacore] Interceptor registrado');
-                }
-            }
-
-            setInterval(() => HC.monitor(), 3000);
-            HC.ui();
-            console.log('[Hannacore] v2.0 carregado');
-        },
-
-        resolve(name, vis = {}) {
-            if (vis[name]) return '';
-            vis[name] = true;
-            const sk = HC.skills[name];
-            if (!sk) return '';
-            let txt = sk.t || '';
-            if (sk.inh) {
-                const p = HC.resolve(sk.inh, vis);
-                if (p) txt = `${p}\n\n${txt}`;
-            }
-            return txt;
-        },
-
-        activeText() {
-            return Object.entries(HC.skills)
-                .filter(([, s]) => s.on)
-                .map(([name]) => HC.resolve(name))
-                .join('\n\n');
-        },
-
-        monitor() {
-            try {
-                const context = ctx;
-                if (!context?.chat?.length) return;
-                const last = context.chat[context.chat.length - 1];
-                if (last) HC.buf.push(last);
-                if (HC.buf.length > 50) HC.buf.shift();
-                const recent = HC.buf.slice(-5).map(m => m.mes || '').join(' ').toLowerCase();
-                let changed = false;
-                for (const [k, s] of Object.entries(HC.skills)) {
-                    if (s.al || s.on || !s.tr?.length) continue;
-                    if (s.tr.some(t => recent.includes(t))) {
-                        s.on = true;
-                        changed = true;
-                        console.log(`[Hannacore] Skill ativada: ${k}`);
-                    }
-                }
-                if (changed) saveSettingsDebounced();
-            } catch(e) {}
-        },
-
-        ui() {
-            const fab = document.createElement('button');
-            fab.id = 'hc-fab';
-            fab.textContent = '⚙';
-            fab.onclick = () => {
-                const p = document.getElementById('hc-panel');
-                if (p) p.style.display = p.style.display === 'none' ? 'block' : 'none';
-            };
-            document.body.appendChild(fab);
-
-            const p = document.createElement('div');
-            p.id = 'hc-panel';
-            p.innerHTML = `<div style="background:#181825;color:#cdd6f4;padding:16px;border-radius:12px;max-width:380px;font-family:sans-serif;font-size:13px;">
-                <h3 style="margin:0 0 12px;color:#cba6f7;">⚙️ Hannacore</h3>
-                <label style="font-size:10px;color:#a6adc8;">GitHub Token</label>
-                <input id="hc-gh" type="password" style="width:100%;background:#313244;color:#cdd6f4;border:1px solid #45475a;padding:6px;border-radius:4px;margin-bottom:8px;" value="${HC.cfg.githubToken || ''}">
-                <label style="font-size:10px;color:#a6adc8;">Gist ID</label>
-                <input id="hc-gist" type="text" style="width:100%;background:#313244;color:#cdd6f4;border:1px solid #45475a;padding:6px;border-radius:4px;margin-bottom:8px;" value="${HC.cfg.gistId || ''}">
-                <label style="font-size:10px;color:#a6adc8;">DeepSeek API Key</label>
-                <input id="hc-ds" type="password" style="width:100%;background:#313244;color:#cdd6f4;border:1px solid #45475a;padding:6px;border-radius:4px;margin-bottom:12px;" value="${HC.cfg.deepseekApiKey || ''}">
-                <div style="display:flex;gap:6px;">
-                    <button id="hc-save" style="flex:1;background:#a6e3a1;color:#1e1e2e;border:none;padding:8px;border-radius:4px;font-weight:bold;cursor:pointer;">Salvar</button>
-                    <button id="hc-status" style="flex:1;background:#cba6f7;color:#1e1e2e;border:none;padding:8px;border-radius:4px;font-weight:bold;cursor:pointer;">Status</button>
-                    <button id="hc-close" style="flex:1;background:#f38ba8;color:#1e1e2e;border:none;padding:8px;border-radius:4px;font-weight:bold;cursor:pointer;">X</button>
-                </div>
-                <div id="hc-out" style="margin-top:10px;font-size:11px;color:#a6adc8;max-height:100px;overflow-y:auto;"></div>
-            </div>`;
-            document.body.appendChild(p);
-
-            document.getElementById('hc-save').onclick = () => {
-                HC.cfg.githubToken = document.getElementById('hc-gh').value.trim();
-                HC.cfg.gistId = document.getElementById('hc-gist').value.trim();
-                HC.cfg.deepseekApiKey = document.getElementById('hc-ds').value.trim();
-                saveSettingsDebounced();
-                const o = document.getElementById('hc-out');
-                if (o) o.innerHTML = '✅ Configuracoes salvas<br>' + o.innerHTML;
-            };
-            document.getElementById('hc-status').onclick = () => {
-                const a = Object.entries(HC.skills).filter(([, s]) => s.on).map(([n]) => n);
-                const o = document.getElementById('hc-out');
-                if (o) o.innerHTML = `📊 Skills ativas: ${a.join(', ') || 'nenhuma'}<<br>${o.innerHTML}`;
-            };
-            document.getElementById('hc-close').onclick = () => { p.style.display = 'none'; };
+async function processarBloco() {
+    if (!menteAtiva || !apiKey || running) return;
+    running = true;
+    try {
+        const ctx = getContext();
+        if (!ctx.chat?.length) { $('#mv_status').text('— chat vazio'); return; }
+        const blocoAtual = Math.floor(ctx.chat.length / menteInterval);
+        $('#mv_status').text(`⟳ resumindo bloco ${blocoAtual}...`);
+        const resumo = await extrairResumo(ctx);
+        if (!resumo) {
+            if ($('#mv_status').text().includes('resumindo')) $('#mv_status').text('— nada relevante');
+            return;
         }
-    };
+        await salvarResumo(blocoAtual, resumo);
+        $('#mv_status').text(`✓ bloco ${blocoAtual} salvo`);
+        await injetarEstado();
+        carregarListaNaUI();
+    } catch(e) { $('#mv_status').text(`✕ ${e.message.substring(0,50)}`); }
+    finally { running = false; }
+}
 
-    HC.init();
-})();
+// ==================== UI ====================
+
+async function carregarListaNaUI() {
+    try {
+        const resumos = await carregarResumos();
+        const lista = resumos.slice(-5).reverse().map(r => {
+            const data = new Date(r.data);
+            const hora = `${String(data.getHours()).padStart(2,'0')}:${String(data.getMinutes()).padStart(2,'0')}`;
+            return `<div style="font-size:0.78em;color:#888;margin:2px 0;padding:3px 0;border-bottom:1px solid #222">
+              📝 <b>Bloco ${r.bloco}</b> · ${hora}<br>
+              ${r.texto?.substring(0, 100)}${(r.texto?.length > 100) ? '...' : ''}
+            </div>`;
+        }).join('');
+        $('#mv_lista').html(lista || '<div style="color:#555;font-size:0.78em">nenhum resumo ainda</div>');
+        $('#mv_contador').text(resumos.length);
+    } catch(e) {
+        $('#mv_lista').html('<div style="color:#a55;font-size:0.78em">erro ao carregar</div>');
+    }
+}
+
+function injectUI() {
+    const $t = $('#extensions_settings2').length ? $('#extensions_settings2') : $('#extensions_settings');
+    if (!$t.length) { setTimeout(injectUI, 1000); return; }
+    const html = `<div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🧠 HannaCore</b> <span style="font-size:0.7em;color:#555">v0.1.0</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content" style="display:flex;flex-direction:column;gap:8px;padding:8px 0"><div style="display:flex;gap:12px;align-items:center"><span style="font-size:2em;font-weight:bold;color:#8b7355" id="mv_contador">0</span><span style="font-size:0.8em;color:#666">blocos</span></div><input id="mv_api_key" type="password" class="text_pole" placeholder="API Key NanoGPT"><input id="mv_interval" type="number" class="text_pole" value="50" min="10" max="200" placeholder="Mensagens por bloco"><label style="display:flex;align-items:center;gap:8px;font-size:0.85em;color:#aaa"><input type="checkbox" id="mv_ativa" checked> Módulo ativo</label><label style="display:flex;align-items:center;gap:8px;font-size:0.85em;color:#e8a0a0"><input type="checkbox" id="mv_injetar_rp"> Injetar estado no RP</label><div style="display:flex;gap:6px;flex-wrap:wrap"><input id="mv_save" type="button" class="menu_button" value="💾 Salvar"><input id="mv_now" type="button" class="menu_button" value="↺ Resumir agora"></div><div id="mv_status" style="font-size:0.82em;color:#aaa">pronto</div><div style="font-size:0.75em;text-transform:uppercase;color:#666;letter-spacing:1px;margin-top:4px">Últimos resumos</div><div id="mv_lista" style="max-height:200px;overflow-y:auto"><div style="color:#555;font-size:0.78em">nenhum resumo ainda</div></div></div></div>`;
+    $t.append(html);
+
+    $('#mv_save').on('click', () => {
+        apiKey = $('#mv_api_key').val().trim();
+        menteInterval = parseInt($('#mv_interval').val()) || 50;
+        menteAtiva = $('#mv_ativa').prop('checked');
+        injetarNoRP = $('#mv_injetar_rp').prop('checked');
+        localStorage.setItem(LS, JSON.stringify({ apiKey, menteModel, menteInterval, menteAtiva, mentePrompt, injetarNoRP }));
+        $('#mv_status').text('✓ salvo');
+        carregarListaNaUI();
+    });
+
+    $('#mv_now').on('click', () => {
+        ultimoProcessamento = Math.max(0, (getContext().chat?.length || 0) - menteInterval);
+        processarBloco();
+    });
+
+    $('#mv_injetar_rp').on('change', async () => {
+        injetarNoRP = $('#mv_injetar_rp').prop('checked');
+        const config = JSON.parse(localStorage.getItem(LS) || '{}');
+        config.injetarNoRP = injetarNoRP;
+        localStorage.setItem(LS, JSON.stringify(config));
+        if (!injetarNoRP) {
+            setExtensionPrompt('HANNACORE_ESTADO', '', 1, 1);
+            $('#mv_status').text('⚠ injeção DESLIGADA');
+        } else {
+            await injetarEstado();
+            carregarListaNaUI();
+            $('#mv_status').text('⚠ injeção LIGADA');
+        }
+    });
+}
+
+// ==================== INICIALIZAÇÃO ====================
+function syncUltimoProcessamento() { ultimoProcessamento = getContext().chat?.length || 0; }
+eventSource.on(event_types.APP_READY, () => { syncUltimoProcessamento(); carregarListaNaUI(); });
+eventSource.on(event_types.CHAT_CHANGED, () => { syncUltimoProcessamento(); carregarListaNaUI(); });
+eventSource.on(event_types.MESSAGE_RECEIVED, () => {
+    const total = getContext().chat?.length || 0;
+    if (total - ultimoProcessamento >= menteInterval) { ultimoProcessamento = total; processarBloco(); }
+});
+setTimeout(injectUI, 3000);
+console.log('[HannaCore] Módulo carregado — v0.1.0');
